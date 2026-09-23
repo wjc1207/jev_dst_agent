@@ -184,7 +184,7 @@ def conservative_tool_uses(state: dict, prefab: str) -> int:
 
 def has_immediate_threat(state: dict, threshold: float = 5.0) -> bool:
     return any(
-        entity.get("attackable") is True
+        entity.get("activeThreat")
         and float(entity.get("distance", 999)) <= threshold
         for entity in state.get("nearby", [])
     )
@@ -464,6 +464,7 @@ def compact_game_state(state: dict) -> dict:
                 "pickable": entity.get("pickable"),
                 "work_required": entity.get("work_required"),
                 "attackable": entity.get("attackable", False),
+                "activeThreat": entity.get("activeThreat", False),
             }
             for entity in state.get("nearby", [])
         ],
@@ -626,19 +627,6 @@ def run_decision_cycle(args, api_url: str, api_key: str, model: str) -> bool:
         print(f"abstained: confidence below {threshold:.2f}")
         return False
 
-    phase = state.get("world", {}).get("phase")
-    night_safe_kinds = {
-        "wait",
-        "craft_torch",
-        "equip_torch",
-        "build_campfire",
-        "eat_safe_food",
-        "flee_from_nearest_hostile",
-    }
-    if phase == "night" and not has_equipped_torch(state) and dispatch[choice]["kind"] not in night_safe_kinds:
-        print("abstained: hard safety rule blocks movement or collection at night without an equipped torch")
-        return False
-
     execute_action(dispatch[choice], args.log, args.move_seconds)
     print("action_executed")
     return False
@@ -770,6 +758,22 @@ def main() -> int:
         durable["player"]["inventory"]["items"][0]["durability_percent"] = 0.14
         worn_criteria, _ = build_candidates(durable)
         assert "chop_nearest_tree" not in worn_criteria
+        threat = {
+            "world": {"day": 1, "phase": "day"},
+            "crafting": {},
+            "player": {
+                "vitals": {"health": 150, "hunger": 100, "hunger_max": 150, "sanity": 200},
+                "inventory": {"items": [], "equipped": []},
+            },
+            "nearby": [
+                {"guid": 201, "prefab": "tallbird", "distance": 4.0, "tags": [], "activeThreat": False, "attackable": True},
+            ],
+        }
+        threat_criteria, threat_dispatch = build_candidates(threat)
+        assert "flee_from_nearest_hostile" in threat_criteria
+        assert threat_dispatch["flee_from_nearest_hostile"]["guid"] == 201
+        assert "equip_weapon" not in threat_criteria
+        assert "attack_nearest_hostile" not in threat_criteria
         print("self-test passed")
         return 0
 

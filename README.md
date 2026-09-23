@@ -1,8 +1,12 @@
-# JEV DST Agent 1.0.2——状态感知、有限控制与 JEV 决策
+# JEV DST Agent 1.0.3——状态感知、有限控制与 JEV 决策
 
 [English README](README.md)
 
 本项目通过一个《饥荒联机版》客户端 Mod，将游戏状态提供给 JEV，并执行 JEV 选择的有限动作。控制器只能执行本文明确列出的动作。
+
+>上一个milestone: [活过第一晚](https://bilibili.com/video/BV1aehE6DEji/)
+>
+>当前milestone: 制作炼金引擎
 
 ## 输出的游戏状态
 
@@ -170,3 +174,5 @@ score = information_gain * 10 - distance * 0.5 - visits * 6
 - 攻击：`0.45`，且没有装备武器时不可用。
 
 可通过 `--min-confidence` 统一覆盖这些阈值。夜晚没有装备火把时，硬性安全规则会阻止移动或采集；逃离迫近敌人是唯一例外。Git 会忽略 `.env`，发布压缩包也会刻意排除该文件。
+
+> 特别感谢[TerraBlind](https://github.com/Reisenbug/TerraBlind)对本项目的启发

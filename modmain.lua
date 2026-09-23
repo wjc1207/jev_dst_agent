@@ -290,8 +290,13 @@ local function read_nearby(player)
                 record.work_required = MINE_WORK_BY_PREFAB[entity.prefab or ""]
             end
             local combat = player.replica ~= nil and player.replica.combat or nil
-            record.attackable = entity:HasAnyTag("hostile", "monster")
-                and combat ~= nil
+            record.activeThreat = entity.replica ~= nil
+                and entity.replica.combat ~= nil
+                and safe_call(function()
+                    return entity.replica.combat:GetTarget() == player
+                end, false)
+
+            record.attackable = combat ~= nil
                 and safe_call(function() return combat:CanTarget(entity) end, false)
             table.insert(nearby, record)
         end
