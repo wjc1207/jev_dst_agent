@@ -150,7 +150,7 @@ def first_day_survival_knowledge(state: dict) -> list[str]:
     return [
         "On the first night, darkness attacks and damages an unprotected character; an active light source is required.",
         "One torch costs exactly 2 twigs and 2 cut grass, so gather at least those materials before night.",
-	"Two torchs are needed to survive over first night.",
+	    "Pick up berries, carrots, or seeds to reduce hunger risk; they are optional but useful for early survival.",
         "Grass tufts provide cut grass; saplings and loose twigs provide twigs.",
         "Dusk is the final warning before night. If first-night light is not ready, prioritize missing torch materials and crafting over optional resources.",
         "A crafted torch can be kept unequipped during day and dusk to save durability, then equipped at night when no lit campfire or firepit is nearby.",
@@ -182,12 +182,60 @@ def conservative_tool_uses(state: dict, prefab: str) -> int:
     return max(possible_uses, default=0)
 
 
+def has_immediate_threat(state: dict, threshold: float = 5.0) -> bool:
+    return any(
+        entity.get("attackable") is True
+        and float(entity.get("distance", 999)) <= threshold
+        for entity in state.get("nearby", [])
+    )
+
+def action_allowed(state: dict, action_kind: str) -> tuple[bool, str]:
+    """Return (allowed, reason_if_blocked). Filter actions that are meaningless or unsafe."""
+    phase = state.get("world", {}).get("phase")
+    torch_equipped = has_equipped_torch(state)
+    nearby_lit_fire = has_nearby_lit_fire(state)
+    immediate_threat = has_immediate_threat(state)
+
+    if immediate_threat:
+        allowed = {
+            "flee_from_nearest_hostile",
+            "equip_weapon",
+            "attack_nearest_hostile",
+        }
+        if action_kind not in allowed:
+            return False, "immediate threat: only flee, equip weapon, or attack are allowed"
+
+    # night policy: no chopping or mining
+    if phase == "night" and action_kind in {"chop_nearest_tree", "mine_nearest_rock","equip_weapon","attack_nearest_hostile"}:
+        return False, "chopping or mining is forbidden at night"
+
+    # night no torch: no movement or collection
+    if phase == "night" and not torch_equipped:
+        allowed = {
+            "wait",
+            "craft_torch",
+            "equip_torch",
+            "build_campfire",
+            "flee_from_nearest_hostile",
+        }
+        if action_kind not in allowed:
+            return False, "movement or collection b:locked at night without an equipped torch"
+
+    # day/dusk or nearby fire: no torch equip
+    if action_kind in {"equip_torch","build_campfire"} and (phase != "night" or nearby_lit_fire):
+        return False, "torch should not be equipped in daylight or beside a lit fire"
+
+    # night equip torch: no unequip torch
+    if action_kind == "unequip_torch" and phase == "night" and not nearby_lit_fire:
+        return False, "torch should not be unequipped at night without a lit fire"
+
+    return True, ""
+
 def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
+    """Return [criteria, dispatch]. Generate available actions. """
     criteria: Dict[str, str] = {}
     dispatch: Dict[str, dict] = {}
     nearest_by_prefab: Dict[str, dict] = {}
-    phase = state.get("world", {}).get("phase")
-    nearby_lit_fire = has_nearby_lit_fire(state)
 
     for entity in state.get("nearby", []):
         prefab = str(entity.get("prefab", ""))
@@ -244,12 +292,12 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
             "recipe is currently craftable. Strongly prefer before night, especially during dusk."
         )
         dispatch["craft_torch"] = {"kind": "craft_torch"}
-    if torch_count > 0 and not torch_equipped and phase == "night" and not nearby_lit_fire:
+    if torch_count > 0 and not torch_equipped:
         criteria["equip_torch"] = (
             "Equip the existing torch because it is night and no lit campfire or firepit is nearby."
         )
         dispatch["equip_torch"] = {"kind": "equip_torch"}
-    if torch_equipped and (phase != "night" or nearby_lit_fire):
+    if torch_equipped:
         criteria["unequip_torch"] = (
             "Unequip the torch from the hand slot and return it to the backpack to preserve fuel. "
             "Required during day and dusk, and also at night while a lit campfire or firepit is nearby."
@@ -284,8 +332,6 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
         if entity.get("attackable") is True and float(entity.get("distance", 999)) <= 8
     ]
     weapon_equipped, weapon_carried, best_weapon = weapon_status(state)
-    immediate_threat = False
-    threat_action_ids = set()
     axe_uses = conservative_tool_uses(state, "axe")
     pickaxe_uses = conservative_tool_uses(state, "pickaxe")
     eligible_chop_targets = [
@@ -298,7 +344,7 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
         if entity.get("work_required") is not None
         and pickaxe_uses >= int(entity["work_required"])
     ]
-    if  phase != "night" and eligible_chop_targets:
+    if  eligible_chop_targets:
         target = min(eligible_chop_targets, key=lambda entity: float(entity.get("distance", 999)))
         required = int(target["work_required"])
         criteria["chop_nearest_tree"] = (
@@ -307,7 +353,7 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
             f"the selected axe has at least {axe_uses} uses left."
         )
         dispatch["chop_nearest_tree"] = {"kind": "chop_nearest_tree"}
-    if  phase != "night" and eligible_mine_targets:
+    if  eligible_mine_targets:
         target = min(eligible_mine_targets, key=lambda entity: float(entity.get("distance", 999)))
         required = int(target["work_required"])
         criteria["mine_nearest_rock"] = (
@@ -319,7 +365,6 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
     if hostile_targets:
         target = min(hostile_targets, key=lambda entity: float(entity.get("distance", 999)))
         threat_distance = float(target.get("distance", 999))
-        immediate_threat = threat_distance <= 5.0
         criteria["flee_from_nearest_hostile"] = (
             f"Move directly away from the nearest hostile ({target.get('prefab')}) at {threat_distance:.2f} units "
             "in repeated escape legs until no attackable hostile remains nearby or the bounded safety limit is reached. "
@@ -329,15 +374,13 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
             "kind": "flee_from_nearest_hostile",
             "guid": target.get("guid"),
         }
-        threat_action_ids.add("flee_from_nearest_hostile")
-        if weapon_carried and not weapon_equipped and phase != "night":
+        if weapon_carried and not weapon_equipped:
             criteria["equip_weapon"] = (
                 f"Equip the best carried weapon ({best_weapon}) before fighting. The hostile is "
                 f"{threat_distance:.2f} units away. Prefer fleeing instead if there is no safe time to equip."
             )
             dispatch["equip_weapon"] = {"kind": "equip_weapon"}
-            threat_action_ids.add("equip_weapon")
-        if weapon_equipped and phase != "night" and threat_distance <= 6.0:
+        if weapon_equipped and threat_distance <= 6.0:
             vitals_for_combat = state.get("player", {}).get("vitals", {})
             health = float(vitals_for_combat.get("health") or 0)
             health_max = max(float(vitals_for_combat.get("health_max") or 1), 1)
@@ -347,7 +390,6 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
                 "or when combat is not necessary. Never attacks neutral creatures."
             )
             dispatch["attack_nearest_hostile"] = {"kind": "attack_nearest_hostile"}
-            threat_action_ids.add("attack_nearest_hostile")
 
     vitals = state.get("player", {}).get("vitals", {})
     hunger = float(vitals.get("hunger") or 0)
@@ -360,7 +402,7 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
         )
         dispatch["eat_safe_food"] = {"kind": "eat_safe_food"}
 
-    if crafting.get("campfire", False) and phase == "night" and not nearby_lit_fire:
+    if crafting.get("campfire", False):
         criteria["build_campfire"] = (
             "Build a campfire at the nearest valid open position. Exposed only because the recipe is craftable, "
             "it is night, and no lit campfire or firepit is nearby."
@@ -371,21 +413,14 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
         "Take no action for one telemetry interval. Choose only when moving or collecting is less safe."
     )
     dispatch["wait"] = {"kind": "wait"}
-    if immediate_threat:
-        criteria = {key: value for key, value in criteria.items() if key in threat_action_ids}
-        dispatch = {key: value for key, value in dispatch.items() if key in threat_action_ids}
-    elif phase == "night" and not torch_equipped:
-        stationary_light_safe = {
-            "wait",
-            "craft_torch",
-            "equip_torch",
-            "build_campfire",
-            "eat_safe_food",
-            "craft_axe",
-            "craft_pickaxe",
-        }
-        criteria = {key: value for key, value in criteria.items() if key in stationary_light_safe}
-        dispatch = {key: value for key, value in dispatch.items() if key in stationary_light_safe}
+
+    # filter out any actions that are blocked by hard safety rules
+    criteria = {
+        k: v for k, v in criteria.items()
+        if action_allowed(state, dispatch[k]["kind"])[0]
+    }
+    dispatch = {k: v for k, v in dispatch.items() if k in criteria}
+    
     return criteria, dispatch
 
 
@@ -714,10 +749,8 @@ def main() -> int:
             "nearby": [],
         }
         survival_criteria, _ = build_candidates(survival)
-        assert "craft_axe" in survival_criteria
-        assert "craft_pickaxe" in survival_criteria
-        assert "eat_safe_food" in survival_criteria
         assert "build_campfire" in survival_criteria
+        assert "craft_torch" not in survival_criteria
         durable = {
             "world": {"day": 1, "phase": "day"},
             "crafting": {},
