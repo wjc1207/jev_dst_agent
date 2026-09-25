@@ -29,6 +29,7 @@ SAFE_COLLECT_PREFABS = {
     "flint": "Loose flint; useful for early tools.",
     "log": "Loose log; needed for campfires and early structures.",
     "rocks": "Loose rocks; needed for early tools and structures.",
+    "goldnugget": "Loose gold; useful for early tools and structures.",
     "berries": "Food that can reduce early hunger risk.",
     "berrybush": "Berry source if it currently offers a pick action.",
     "berrybush2": "Berry source if it currently offers a pick action.",
@@ -195,6 +196,14 @@ def action_allowed(state: dict, action_kind: str) -> tuple[bool, str]:
     torch_equipped = has_equipped_torch(state)
     nearby_lit_fire = has_nearby_lit_fire(state)
     immediate_threat = has_immediate_threat(state)
+    vitals = state.get("player", {}).get("vitals", {})
+    hunger = float(vitals.get("hunger") or 1)
+    hunger_max = max(float(vitals.get("hunger_max") or 1), 1)
+
+    if hunger / hunger_max < 0.20 and action_kind not in {
+        "eat_safe_food", "wait", "collect", "flee_from_nearest_hostile"
+    }:
+        return False, "hunger is below 20%: only eat or wait are allowed"
 
     if immediate_threat:
         allowed = {
@@ -281,6 +290,8 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
             "target_x": frontier_leg.get("x"),
             "target_z": frontier_leg.get("z"),
             "leg_distance": frontier_leg.get("distance"),
+            "frontier_x": frontier_target.get("x"),
+            "frontier_z": frontier_target.get("z"),
         }
 
     counts = inventory_counts(state)
@@ -327,9 +338,13 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
         entity for entity in nearby
         if "MINE_workable" in entity.get("tags", []) and float(entity.get("distance", 999)) <= 6
     ]
-    hostile_targets = [
+    attackable_targets = [
         entity for entity in nearby
         if entity.get("attackable") is True and float(entity.get("distance", 999)) <= 8
+    ]
+    pursuing_targets = [
+        entity for entity in nearby
+        if entity.get("activeThreat") is True and float(entity.get("distance", 999)) <= 12
     ]
     weapon_equipped, weapon_carried, best_weapon = weapon_status(state)
     axe_uses = conservative_tool_uses(state, "axe")
@@ -362,18 +377,21 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
             f"the selected pickaxe has at least {pickaxe_uses} uses left."
         )
         dispatch["mine_nearest_rock"] = {"kind": "mine_nearest_rock"}
-    if hostile_targets:
-        target = min(hostile_targets, key=lambda entity: float(entity.get("distance", 999)))
+    if pursuing_targets:
+        target = min(pursuing_targets, key=lambda entity: float(entity.get("distance", 999)))
         threat_distance = float(target.get("distance", 999))
         criteria["flee_from_nearest_hostile"] = (
-            f"Move directly away from the nearest hostile ({target.get('prefab')}) at {threat_distance:.2f} units "
-            "in repeated escape legs until no attackable hostile remains nearby or the bounded safety limit is reached. "
+            f"Move directly away from the nearest pursuing hostile ({target.get('prefab')}) at {threat_distance:.2f} units "
+            "in repeated escape legs until no active pursuer remains nearby or the bounded safety limit is reached. "
             "Strongly prefer when unarmed, badly hurt, or fighting is unnecessary."
         )
         dispatch["flee_from_nearest_hostile"] = {
             "kind": "flee_from_nearest_hostile",
             "guid": target.get("guid"),
         }
+    if attackable_targets:
+        target = min(attackable_targets, key=lambda entity: float(entity.get("distance", 999)))
+        threat_distance = float(target.get("distance", 999))
         if weapon_carried and not weapon_equipped:
             criteria["equip_weapon"] = (
                 f"Equip the best carried weapon ({best_weapon}) before fighting. The hostile is "
@@ -409,6 +427,12 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
         )
         dispatch["build_campfire"] = {"kind": "build_campfire"}
 
+    if crafting.get("sciencemachine", False):
+        criteria["build_sciencemachine"] = (
+            "Build a science machine at the nearest valid open position. Exposed only because the recipe is craftable."
+        )
+        dispatch["build_sciencemachine"] = {"kind": "build_sciencemachine"}
+    
     criteria["wait"] = (
         "Take no action for one telemetry interval. Choose only when moving or collecting is less safe."
     )
@@ -517,17 +541,19 @@ def call_jev(api_url: str, api_key: str, model: str, state: dict, criteria: Dict
     return {"response": payload, "answer": answer}
 
 
-def execute_action(action: dict, log_path: Path, move_seconds: float = 1.0) -> None:
+def execute_action(action: dict, log_path: Path, move_seconds: float = 1.0) -> bool:
     kind = action["kind"]
     if kind == "collect":
         controller.collect(log_path, action["prefab"], preferred_guid=action.get("guid"))
     elif kind == "explore":
-        controller.explore_leg(
+        return controller.explore_leg(
             log_path,
             float(action["target_x"]),
             float(action["target_z"]),
             float(action["leg_distance"]),
             move_seconds,
+            frontier_x=float(action["frontier_x"]),
+            frontier_z=float(action["frontier_z"]),
         )
     elif kind == "wait":
         time.sleep(1.0)
@@ -543,6 +569,8 @@ def execute_action(action: dict, log_path: Path, move_seconds: float = 1.0) -> N
         controller.craft_inventory_item(log_path, "pickaxe", "craft_pickaxe")
     elif kind == "build_campfire":
         controller.build_campfire(log_path)
+    elif kind == "build_sciencemachine":
+        controller.build_sciencemachine(log_path)
     elif kind == "eat_safe_food":
         controller.eat_safe_food(log_path)
     elif kind == "chop_nearest_tree":
@@ -557,6 +585,7 @@ def execute_action(action: dict, log_path: Path, move_seconds: float = 1.0) -> N
         controller.flee_from_hostile(log_path, preferred_guid=action.get("guid"))
     else:
         raise RuntimeError(f"Unsupported bounded action kind: {kind}")
+    return True
 
 
 def default_execution_threshold(choice: str) -> float:
@@ -627,8 +656,8 @@ def run_decision_cycle(args, api_url: str, api_key: str, model: str) -> bool:
         print(f"abstained: confidence below {threshold:.2f}")
         return False
 
-    execute_action(dispatch[choice], args.log, args.move_seconds)
-    print("action_executed")
+    executed = execute_action(dispatch[choice], args.log, args.move_seconds)
+    print("action_executed" if executed else "action_skipped: state changed before execution")
     return False
 
 
@@ -729,7 +758,7 @@ def main() -> int:
         assert "unequip_torch" not in night_criteria
         survival = {
             "world": {"day": 1, "phase": "night"},
-            "crafting": {"torch": False, "axe": True, "pickaxe": True, "campfire": True},
+            "crafting": {"torch": False, "axe": True, "pickaxe": True, "campfire": True, "sciencemachine": False},
             "player": {
                 "vitals": {"health": 150, "hunger": 50, "hunger_max": 150, "sanity": 200},
                 "inventory": {"items": [{"prefab": "berries", "count": 2}], "equipped": []},
@@ -739,6 +768,7 @@ def main() -> int:
         survival_criteria, _ = build_candidates(survival)
         assert "build_campfire" in survival_criteria
         assert "craft_torch" not in survival_criteria
+        assert "build_sciencemachine" not in survival_criteria
         durable = {
             "world": {"day": 1, "phase": "day"},
             "crafting": {},
@@ -766,7 +796,7 @@ def main() -> int:
                 "inventory": {"items": [], "equipped": []},
             },
             "nearby": [
-                {"guid": 201, "prefab": "tallbird", "distance": 4.0, "tags": [], "activeThreat": False, "attackable": True},
+                {"guid": 201, "prefab": "tallbird", "distance": 4.0, "tags": [], "activeThreat": True, "attackable": True},
             ],
         }
         threat_criteria, threat_dispatch = build_candidates(threat)

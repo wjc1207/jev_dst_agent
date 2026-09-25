@@ -1,4 +1,4 @@
-# JEV DST Agent 1.0.2 — telemetry, bounded controls and JEV decisions
+# JEV DST Agent 1.0.6 — telemetry, bounded controls and JEV decisions
 
 This package connects JEV decisions to a bounded Don't Starve Together client Mod.
 It exports game state and can execute only the actions explicitly listed below.
@@ -14,8 +14,11 @@ Once per second, the client mod writes one JSON record to `client_log.txt` with:
 - nearby useful items, resources, light sources and threats.
 - persistent frontier-navigation state, target point and current leg.
 
-Every record starts with `[JEV_DST_STATE]`, so the companion watcher can ignore
-all unrelated game logs.
+Short records start with `[JEV_DST_STATE]`. Records longer than the safe game-log
+line size are emitted as numbered `[JEV_DST_CHUNK]` lines and reassembled by
+Python. A trailing tab added by the game log is removed from each part first.
+The controller and watcher accept only complete, valid JSON records;
+truncated lines left by older Mod versions are ignored.
 
 On day one, the compact JSON sent through the JEV API's `state` field also
 contains a `knowledge` array of plain-English game facts. It explains first-night
@@ -96,15 +99,15 @@ versus live resource selection, GUID handoff, fallback selection, and collection
 completion when inventory increases while the harvested plant remains visible.
 
 Collection movement uses distance-scaled pulses: up to one second while far
-away, braking to 0.18 seconds near interaction range. A hostile within five
-world units interrupts collection immediately. When a hostile is close, an
-unarmed character receives only a flee action; a carried weapon can be equipped,
-and attack is exposed only while a weapon is already equipped. Fleeing remains
-available in every case and during night. A flee action is a bounded sequence,
-not a single short tap: after every 1.2-second movement burst the controller
-reads fresh telemetry and recomputes the direction away from the pursuing
-hostile. It stops after two consecutive clear observations, or after eight
-bursts as a safety limit.
+away, braking to 0.18 seconds near interaction range. An active pursuer within
+five world units interrupts collection immediately. When pursued at close range,
+an unarmed character receives only a flee action; a carried weapon can be
+equipped, and attack is exposed only while a weapon is already equipped. Fleeing
+remains available during night and below 20% hunger. Only entities marked
+`activeThreat` expose fleeing. A flee action is a bounded sequence: after every
+one-second movement burst the controller reads fresh telemetry and recomputes
+the direction away from the pursuer. It stops after two consecutive clear
+observations, or after eight bursts as a safety limit.
 
 Light management is phase-driven: the equip action is hidden during day and
 dusk, while unequipping remains one option among JEV's other actions. At night,
@@ -221,6 +224,12 @@ whether to continue exploring or perform another meaningful action. Direction
 keys are only an execution detail derived from the target vector. Adjust the
 duration of a full four-unit leg with `--move-seconds`; the default is one
 second and accepted values are 0.2–2.0 seconds.
+
+The controller checks actual position after each leg. If the same frontier
+produces less than 0.15 units of progress twice in succession, it asks the Mod
+to blacklist that frontier for 30 seconds and select another one. JEV still
+chooses the next action after each leg. If the player moves during a JEV call,
+the controller follows the Mod's latest passable leg for the same frontier.
 
 Equipping a torch uses the same inventory-tile action as manually clicking the
 torch, rather than the action-system auto-equip helper.

@@ -4,7 +4,7 @@ Exports the local player's structured state to client_log.txt and accepts
 semantic actions from the local JEV controller.
 ]]
 author = "Local JEV Agent"
-version = "1.0.2"
+version = "1.0.6"
 
 api_version = 10
 dst_compatible = true
@@ -33,10 +33,11 @@ configuration_options =
         hover = "World units searched for useful resources, light and danger.",
         options =
         {
-            { description = "8", data = 8 },
-            { description = "12", data = 12 },
-            { description = "16", data = 16 },
+            { description = "10", data = 10 },
+            { description = "15", data = 15 },
+            { description = "20", data = 20 },
+            { description = "25", data = 25 }
         },
-        default = 12,
+        default = 15,
     },
 }

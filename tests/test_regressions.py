@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import unittest
+import json
+import tempfile
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 
 import controller
 import jev_agent
+import telemetry
 
 
 def grass(guid: int, distance: float, pickable: bool) -> dict:
@@ -31,6 +34,7 @@ def hostile(guid: int, distance: float) -> dict:
         "dz": 0,
         "tags": ["hostile", "monster"],
         "attackable": True,
+        "activeThreat": True,
     }
 
 
@@ -125,6 +129,7 @@ class CandidateTests(unittest.TestCase):
         self.assertNotIn("explore_up", criteria)
         self.assertEqual(dispatch["explore"]["kind"], "explore")
         self.assertEqual(dispatch["explore"]["target_z"], 4.0)
+        self.assertEqual(dispatch["explore"]["frontier_z"], 12.0)
 
     def test_torch_is_never_equipped_during_day_or_dusk(self) -> None:
         for phase in ("day", "dusk"):
@@ -210,6 +215,36 @@ class CandidateTests(unittest.TestCase):
 
         self.assertEqual(set(criteria), {"flee_from_nearest_hostile"})
 
+    def test_low_hunger_cannot_remove_flee_during_attack(self) -> None:
+        observed = state([hostile(30, 4.0)])
+        observed["player"]["vitals"]["hunger"] = 10
+
+        criteria, _ = jev_agent.build_candidates(observed)
+
+        self.assertEqual(set(criteria), {"flee_from_nearest_hostile"})
+
+    def test_attackable_non_pursuer_does_not_offer_flee(self) -> None:
+        observed = state([hostile(30, 4.0)])
+        observed["nearby"][0]["activeThreat"] = False
+
+        criteria, _ = jev_agent.build_candidates(observed)
+
+        self.assertNotIn("flee_from_nearest_hostile", criteria)
+
+    def test_pursuer_can_be_fled_even_when_not_attackable(self) -> None:
+        observed = state([hostile(30, 4.0)])
+        observed["nearby"][0]["attackable"] = False
+
+        criteria, dispatch = jev_agent.build_candidates(observed)
+
+        self.assertIn("flee_from_nearest_hostile", criteria)
+        self.assertEqual(dispatch["flee_from_nearest_hostile"]["guid"], 30)
+
+    def test_pursuer_in_twelve_unit_escape_range_offers_flee(self) -> None:
+        criteria, _ = jev_agent.build_candidates(state([hostile(30, 10.0)]))
+
+        self.assertIn("flee_from_nearest_hostile", criteria)
+
     def test_carried_weapon_must_be_equipped_before_attack(self) -> None:
         observed = state([hostile(30, 4.0)])
         observed["player"]["inventory"]["items"] = [
@@ -235,8 +270,10 @@ class ControllerTests(unittest.TestCase):
     def test_explore_walks_one_frontier_leg(self) -> None:
         before = state([])
         after = state([])
+        after["player"]["position"]["z"] = 3.5
         tap = Mock()
         release = Mock()
+        controller.EXPLORATION_STALL.update(target=None, count=0, last_position=None)
 
         with (
             patch.object(controller, "latest_state", return_value=(before, 100)),
@@ -256,6 +293,54 @@ class ControllerTests(unittest.TestCase):
 
         tap.assert_called_once_with([controller.VK["up"]], 1.0)
         release.assert_called_once_with()
+
+    def test_two_stalled_exploration_legs_reject_current_frontier(self) -> None:
+        observed = state([])
+        replanned = state([])
+        replanned["navigation"]["target"]["x"] = 12.0
+        controller.EXPLORATION_STALL.update(target=None, count=0, last_position=None)
+        tap = Mock()
+        with (
+            patch.object(controller, "latest_state", return_value=(observed, 100)),
+            patch.object(controller, "find_game_window", return_value=123),
+            patch.object(controller, "focus_game"),
+            patch.object(controller, "wait_for_fresh_state", side_effect=[(observed, 101), (observed, 102)]),
+            patch.object(controller, "wait_for_state_condition", return_value=(replanned, 103)) as verified,
+            patch.object(controller, "tap", tap),
+            patch.object(controller, "release_movement_keys"),
+        ):
+            for _ in range(2):
+                controller.explore_leg(
+                    Path("unused.log"), 0.0, 4.0, 4.0, 1.0,
+                    frontier_x=0.0, frontier_z=12.0,
+                )
+
+        self.assertEqual(tap.call_args_list, [
+            call([controller.VK["up"]], 1.0),
+            call([controller.VK["up"]], 1.0),
+            call([controller.VK["reject_frontier"]], 0.08),
+        ])
+        verified.assert_called_once()
+        self.assertEqual(controller.EXPLORATION_STALL["count"], 0)
+
+    def test_explore_uses_updated_leg_for_same_frontier(self) -> None:
+        observed = state([])
+        observed["navigation"]["leg"]["x"] = 4.0
+        observed["navigation"]["leg"]["z"] = 0.0
+        after = state([])
+        after["player"]["position"]["x"] = 3.5
+        tap = Mock()
+        with (
+            patch.object(controller, "latest_state", return_value=(observed, 100)),
+            patch.object(controller, "find_game_window", return_value=123),
+            patch.object(controller, "focus_game"),
+            patch.object(controller, "wait_for_fresh_state", return_value=(after, 101)),
+            patch.object(controller, "tap", tap),
+            patch.object(controller, "release_movement_keys"),
+        ):
+            controller.explore_leg(Path("unused.log"), 0.0, 4.0, 4.0)
+
+        tap.assert_called_once_with([controller.VK["right"]], 1.0)
 
     def test_approach_uses_longer_pulses_for_distant_targets(self) -> None:
         self.assertEqual(controller.approach_step_duration(8.0), 1.0)
@@ -285,7 +370,7 @@ class ControllerTests(unittest.TestCase):
         ):
             controller.flee_from_hostile(Path("unused.log"), preferred_guid=30)
 
-        tap.assert_called_once_with([controller.VK["left"]], 1.2)
+        tap.assert_called_once_with([controller.VK["left"]], 1.0)
         release.assert_called_once_with()
 
     def test_flee_repeats_until_chasing_hostile_is_clear(self) -> None:
@@ -316,7 +401,7 @@ class ControllerTests(unittest.TestCase):
 
         self.assertEqual(tap.call_count, 3)
         tap.assert_has_calls(
-            [call([controller.VK["left"]], 1.2)] * 3
+            [call([controller.VK["left"]], 1.0)] * 3
         )
 
     def test_depleted_preferred_guid_falls_back_to_live_grass(self) -> None:
@@ -368,6 +453,44 @@ class ExistingSelfTests(unittest.TestCase):
         self.assertEqual(jev_agent.default_execution_threshold("collect_grass"), 0.25)
         self.assertEqual(jev_agent.default_execution_threshold("craft_torch"), 0.45)
         self.assertEqual(jev_agent.default_execution_threshold("build_campfire"), 0.45)
+
+
+class TelemetryTests(unittest.TestCase):
+    def test_truncated_line_is_ignored_and_chunked_frame_waits_until_complete(self) -> None:
+        original = {"schema": 6, "world": {"day": 1}}
+        updated = {"schema": 7, "world": {"day": 2}, "blob": "x" * 7000}
+        first_line = f"[JEV_DST_STATE]{json.dumps(original)}\n".encode("utf-8")
+        truncated = ("[JEV_DST_STATE]" + json.dumps(updated)[:4070] + "\n").encode("utf-8")
+        encoded = json.dumps(updated)
+        parts = [encoded[index:index + 3000] for index in range(0, len(encoded), 3000)]
+        chunk_lines = [
+            f"[JEV_DST_CHUNK]test-1:{index}:{len(parts)}:{part}\t\n".encode("utf-8")
+            for index, part in enumerate(parts, 1)
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "client_log.txt"
+            log_path.write_bytes(first_line + truncated + b"".join(chunk_lines[:-1]))
+            state_before, position_before = telemetry.latest_state(log_path)
+            self.assertEqual(state_before, original)
+            self.assertEqual(position_before, len(first_line))
+
+            with log_path.open("ab") as stream:
+                stream.write(chunk_lines[-1])
+            state_after, position_after = telemetry.latest_state(log_path)
+            self.assertEqual(state_after, updated)
+            self.assertEqual(position_after, log_path.stat().st_size)
+
+    def test_incomplete_last_log_line_is_not_accepted(self) -> None:
+        complete = b'[JEV_DST_STATE]{"schema":6}\n'
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "client_log.txt"
+            log_path.write_bytes(complete + b'[JEV_DST_STATE]{"schema":7}')
+
+            parsed, position = telemetry.latest_state(log_path)
+
+            self.assertEqual(parsed["schema"], 6)
+            self.assertEqual(position, len(complete))
 
 
 if __name__ == "__main__":

@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from typing import Iterator, Optional
 
+import telemetry
+
 
 PREFIX = "[JEV_DST_STATE]"
 
@@ -19,16 +21,7 @@ def default_log_path() -> Path:
 
 
 def parse_state_line(line: str) -> Optional[dict]:
-    marker = line.find(PREFIX)
-    if marker < 0:
-        return None
-    payload = line[marker + len(PREFIX) :].strip()
-    if not payload:
-        return None
-    value = json.loads(payload)
-    if not isinstance(value, dict):
-        raise ValueError("telemetry payload is not a JSON object")
-    return value
+    return telemetry.StateAssembler().feed(line)
 
 
 def follow(path: Path, from_start: bool = False) -> Iterator[str]:
@@ -40,12 +33,16 @@ def follow(path: Path, from_start: bool = False) -> Iterator[str]:
         if not from_start:
             stream.seek(0, os.SEEK_END)
         last_position = stream.tell()
+        pending = ""
 
         while True:
             line = stream.readline()
             if line:
                 last_position = stream.tell()
-                yield line
+                pending += line
+                if pending.endswith("\n"):
+                    yield pending
+                    pending = ""
                 continue
 
             try:
@@ -55,6 +52,7 @@ def follow(path: Path, from_start: bool = False) -> Iterator[str]:
             if size < last_position:
                 stream.seek(0)
                 last_position = 0
+                pending = ""
             time.sleep(0.2)
 
 
@@ -100,12 +98,9 @@ def main() -> int:
         return run_self_test()
 
     print(f"Watching {args.log}", file=sys.stderr)
+    assembler = telemetry.StateAssembler()
     for line in follow(args.log, args.from_start):
-        try:
-            state = parse_state_line(line)
-        except (json.JSONDecodeError, ValueError) as exc:
-            print(f"Ignored malformed telemetry: {exc}", file=sys.stderr)
-            continue
+        state = assembler.feed(line)
         if state is None:
             continue
         if args.full:
@@ -119,4 +114,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

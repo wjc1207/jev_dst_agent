@@ -3,6 +3,9 @@ local G = GLOBAL
 local protected_call = G.pcall
 
 local LOG_PREFIX = "[JEV_DST_STATE]"
+local CHUNK_PREFIX = "[JEV_DST_CHUNK]"
+local MAX_LOG_PAYLOAD_BYTES = 3000
+local telemetry_sequence = 0
 local SAMPLE_INTERVAL = GetModConfigData("sample_interval") or 1.0
 local SCAN_RADIUS = GetModConfigData("scan_radius") or 12
 local MAX_NEARBY = 40
@@ -91,6 +94,8 @@ local RELEVANT_PREFABS =
     spiderden = true,
     hound = true,
     tentacle = true,
+    goldnugget = true,
+    sciencemachine = true,
 }
 
 local PICKABLE_SOURCE_PREFABS =
@@ -317,6 +322,7 @@ local function read_crafting(player)
         result.campfire = safe_call(function() return builder:CanBuild("campfire") end, false)
         result.axe = safe_call(function() return builder:CanBuild("axe") end, false)
         result.pickaxe = safe_call(function() return builder:CanBuild("pickaxe") end, false)
+        result.sciencemachine = safe_call(function() return builder:CanBuild("sciencemachine") end, false)
     end
     return result
 end
@@ -594,10 +600,52 @@ local function emit_state(player)
 
     local ok, encoded = protected_call(function() return json.encode(make_state(player)) end)
     if ok then
-        print(LOG_PREFIX .. encoded)
+        if #encoded <= MAX_LOG_PAYLOAD_BYTES then
+            print(LOG_PREFIX .. encoded)
+        else
+            local chunks = {}
+            local first = 1
+            while first <= #encoded do
+                local last = math.min(first + MAX_LOG_PAYLOAD_BYTES - 1, #encoded)
+                while last < #encoded do
+                    local next_byte = string.byte(encoded, last + 1)
+                    if next_byte < 128 or next_byte > 191 then
+                        break
+                    end
+                    last = last - 1
+                end
+                table.insert(chunks, string.sub(encoded, first, last))
+                first = last + 1
+            end
+            telemetry_sequence = telemetry_sequence + 1
+            local frame_id = tostring(player.GUID) .. "-" .. tostring(telemetry_sequence)
+            for index, chunk in ipairs(chunks) do
+                print(CHUNK_PREFIX .. frame_id .. ":" .. tostring(index) .. ":"
+                    .. tostring(#chunks) .. ":" .. chunk)
+            end
+        end
     else
         print("[JEV_DST_ERROR]state_encode_failed:" .. tostring(encoded))
     end
+end
+
+local function reject_current_frontier()
+    local player = G.ThePlayer
+    local world = G.TheWorld
+    if player == nil or not player:IsValid() or world == nil then
+        print("[JEV_DST_ACTION_ERROR]reject_frontier:world_or_player_unavailable")
+        return
+    end
+    local memory = get_navigation_memory(world)
+    if memory.target == nil then
+        print("[JEV_DST_ACTION]reject_frontier:no_target")
+        return
+    end
+    local key = memory.target.key
+    memory.blacklist[key] = G.GetTime() + NAV_BLACKLIST_SECONDS
+    memory.target = nil
+    print("[JEV_DST_ACTION]reject_frontier:blacklisted key=" .. tostring(key))
+    emit_state(player)
 end
 
 local function start_telemetry(player)
@@ -986,6 +1034,72 @@ local function build_campfire()
     end)
 end
 
+local function build_science_machine()
+    local player = G.ThePlayer
+    local builder = player ~= nil and player.replica ~= nil and player.replica.builder or nil
+    local recipe = G.GetValidRecipe("sciencemachine")
+    if player == nil or not player:IsValid() or builder == nil or recipe == nil then
+        print("[JEV_DST_ACTION_ERROR]build_science_machine:builder_unavailable")
+        return
+    end
+    if builder:IsBusy() or not builder:CanBuild("sciencemachine") then
+        print("[JEV_DST_ACTION_ERROR]build_science_machine:not_craftable_or_busy")
+        return
+    end
+
+    local controller = player.components ~= nil and player.components.playercontroller or nil
+    if controller == nil then
+        print("[JEV_DST_ACTION_ERROR]build_science_machine:controller_unavailable")
+        return
+    end
+
+    builder:BufferBuild(recipe.name)
+    if not builder:IsBuildBuffered(recipe.name) then
+        print("[JEV_DST_ACTION_ERROR]build_science_machine:buffer_failed")
+        return
+    end
+    controller:StartBuildPlacementMode(recipe, nil)
+    print("[JEV_DST_ACTION]build_science_machine:buffered")
+
+    player:DoTaskInTime(0.35, function()
+        if not player:IsValid() or not builder:IsBuildBuffered(recipe.name) then
+            print("[JEV_DST_ACTION_ERROR]build_science_machine:buffer_lost_before_placement")
+            return
+        end
+
+        local px, py, pz = player.Transform:GetWorldPosition()
+        local point = nil
+        local radii = { 1.25, 1.5, 1.75, 2.0 }
+        for _, radius in ipairs(radii) do
+            for angle = 0, 315, 45 do
+                local radians = angle * G.DEGREES
+                local candidate = G.Vector3(px + math.cos(radians) * radius, 0, pz + math.sin(radians) * radius)
+                if builder:CanBuildAtPoint(candidate, recipe, 0) then
+                    point = candidate
+                    break
+                end
+            end
+            if point ~= nil then
+                break
+            end
+        end
+        if point == nil then
+            controller:CancelPlacement()
+            print("[JEV_DST_ACTION_ERROR]build_science_machine:no_valid_position")
+            return
+        end
+
+        if controller.placer ~= nil then
+            controller.placer.Transform:SetPosition(point.x, point.y, point.z)
+            controller.placer.Transform:SetRotation(0)
+        end
+        builder:MakeRecipeAtPoint(recipe, point, 0)
+        controller:CancelPlacement()
+        print("[JEV_DST_ACTION]build_science_machine:placed x=" .. tostring(round(point.x, 2))
+            .. " z=" .. tostring(round(point.z, 2)))
+    end)
+end
+
 local function equip_torch()
     local player = G.ThePlayer
     if player == nil or not player:IsValid() then
@@ -1107,30 +1221,42 @@ G.TheInput:AddKeyUpHandler(G.KEY_F8, function() perform_work_action(G.ACTIONS.CH
 G.TheInput:AddKeyUpHandler(G.KEY_F9, function() perform_work_action(G.ACTIONS.MINE, "MINE_workable", "pickaxe") end)
 G.TheInput:AddKeyUpHandler(G.KEY_F10, attack_nearest_hostile)
 G.TheInput:AddKeyUpHandler(G.KEY_F11, equip_best_weapon)
+G.TheInput:AddKeyUpHandler(G.KEY_F12, build_science_machine)
+G.TheInput:AddKeyUpHandler(G.KEY_F5, reject_current_frontier)
 
 -- ThePlayer is often still nil while player prefabs are being initialized on a
 -- joining client. Poll from the world instead of making a one-shot comparison.
 -- A world task is also cleaned up automatically when leaving the world.
-AddPrefabPostInit("world", function(world)
-    local attempts = 0
-    local bootstrap_task = nil
+local function try_start_telemetry(player)
+    if player == nil or not player:IsValid() then
+        return
+    end
+    if player ~= G.ThePlayer then
+        return
+    end
+    if player._jev_dst_started then
+        return
+    end
+    player._jev_dst_started = true
+    print("[JEV_DST]local_player_ready prefab=" .. tostring(player.prefab))
+    start_telemetry(player)
+end
 
-    print("[JEV_DST]world_ready waiting_for_local_player")
+AddPlayerPostInit(function(player)
+    if player == nil then
+        return
+    end
+    player:ListenForEvent("playeractivated", function()
+        try_start_telemetry(player)
+    end)
+end)
 
-    bootstrap_task = world:DoPeriodicTask(PLAYER_WAIT_INTERVAL, function()
-        attempts = attempts + 1
-        local player = G.ThePlayer
-
-        if player ~= nil and player:IsValid() then
-            if bootstrap_task ~= nil then
-                bootstrap_task:Cancel()
-                bootstrap_task = nil
-            end
-            print("[JEV_DST]local_player_ready attempts=" .. tostring(attempts)
-                .. " prefab=" .. tostring(player.prefab))
-            start_telemetry(player)
-        elseif attempts == 1 or attempts % 20 == 0 then
-            print("[JEV_DST]waiting_for_local_player attempts=" .. tostring(attempts))
-        end
+AddSimPostInit(function()
+    local world = G.TheWorld
+    if world == nil or not world:IsValid() then
+        return
+    end
+    world:DoTaskInTime(1.0, function()
+        try_start_telemetry(G.ThePlayer)
     end)
 end)

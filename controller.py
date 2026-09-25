@@ -13,6 +13,8 @@ from ctypes import wintypes
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+import telemetry
+
 
 PREFIX = "[JEV_DST_STATE]"
 DEFAULT_LOG = Path.home() / "Documents" / "Klei" / "DoNotStarveTogether" / "client_log.txt"
@@ -36,8 +38,11 @@ VK = {
     "chop_nearest_tree": 0x77, # F8
     "mine_nearest_rock": 0x78, # F9
     "equip_weapon": 0x7A, # F11
+    "build_sciencemachine": 0x7B, # F12
+    "reject_frontier": 0x74, # F5
 }
 MOVEMENT_KEYS = (VK["up"], VK["left"], VK["down"], VK["right"])
+EXPLORATION_STALL = {"target": None, "count": 0, "last_position": None}
 
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
@@ -182,26 +187,11 @@ def tap(keys: Sequence[int], seconds: float) -> None:
 
 
 def parse_state_line(line: str) -> Optional[dict]:
-    marker = line.find(PREFIX)
-    if marker < 0:
-        return None
-    value = json.loads(line[marker + len(PREFIX) :].strip())
-    return value if isinstance(value, dict) else None
+    return telemetry.StateAssembler().feed(line)
 
 
 def latest_state(log_path: Path) -> Tuple[dict, int]:
-    if not log_path.exists():
-        raise RuntimeError(f"DST log does not exist: {log_path}")
-    with log_path.open("rb") as stream:
-        stream.seek(0, os.SEEK_END)
-        end = stream.tell()
-        stream.seek(max(0, end - 2_000_000))
-        data = stream.read().decode("utf-8", errors="replace")
-    for line in reversed(data.splitlines()):
-        state = parse_state_line(line)
-        if state is not None:
-            return state, end
-    raise RuntimeError("No JEV_DST_STATE record found; enter a world with the mod enabled")
+    return telemetry.latest_state(log_path)
 
 
 def wait_for_fresh_state(log_path: Path, old_position: int, timeout: float = 3.0) -> Tuple[dict, int]:
@@ -337,7 +327,7 @@ def nearest_hostile(state: dict, maximum_distance: float = 8.0) -> Optional[dict
         (
             entity
             for entity in state.get("nearby", [])
-            if entity.get("attackable") is True
+            if entity.get("activeThreat") is True
             and float(entity.get("distance", math.inf)) <= maximum_distance
         ),
         key=lambda entity: float(entity.get("distance", math.inf)),
@@ -371,17 +361,50 @@ def explore_leg(
     target_z: float,
     leg_distance: float,
     full_leg_seconds: float = 1.0,
-) -> None:
+    frontier_x: Optional[float] = None,
+    frontier_z: Optional[float] = None,
+) -> bool:
     state, log_position = latest_state(log_path)
+    navigation = state.get("navigation", {})
+    frontier = navigation.get("target") or {}
+    if navigation.get("status") != "ready" or not frontier:
+        print("explore leg skipped: frontier is no longer available")
+        return False
+    frontier_key = (round(float(frontier["x"]), 2), round(float(frontier["z"]), 2))
+    if frontier_x is not None and frontier_z is not None:
+        expected_key = (round(frontier_x, 2), round(frontier_z, 2))
+        if frontier_key != expected_key:
+            print("explore leg skipped: frontier changed since JEV decision")
+            return False
+    current_leg = navigation.get("leg") or {}
+    if current_leg.get("x") is None or current_leg.get("z") is None:
+        print("explore leg skipped: no current path to the frontier")
+        return False
+    current_x = float(current_leg["x"])
+    current_z = float(current_leg["z"])
+    if math.hypot(current_x - target_x, current_z - target_z) > 0.2:
+        print("explore leg updated to the current passable path")
+    target_x = current_x
+    target_z = current_z
+    leg_distance = float(current_leg.get("distance") or leg_distance)
     position = state.get("player", {}).get("position", {})
     if position.get("x") is None or position.get("z") is None:
         raise RuntimeError("Telemetry has no player position for frontier exploration")
+    start_x = float(position["x"])
+    start_z = float(position["z"])
+    if EXPLORATION_STALL["target"] != frontier_key:
+        EXPLORATION_STALL.update(target=frontier_key, count=0, last_position=None)
+    previous_position = EXPLORATION_STALL["last_position"]
+    if previous_position is not None and math.hypot(
+        start_x - previous_position[0], start_z - previous_position[1]
+    ) >= 0.2:
+        EXPLORATION_STALL["count"] = 0
     dx = target_x - float(position["x"])
     dz = target_z - float(position["z"])
     remaining = math.hypot(dx, dz)
     if remaining <= 0.15:
         print("explore leg skipped: leg target already reached")
-        return
+        return False
     keys = movement_keys_for_delta(state, dx, dz)
     if not keys:
         raise RuntimeError("Cannot derive movement keys for frontier leg")
@@ -390,13 +413,48 @@ def explore_leg(
     focus_game(hwnd)
     try:
         tap(keys, duration)
-        wait_for_fresh_state(log_path, log_position)
+        fresh, fresh_position = wait_for_fresh_state(log_path, log_position)
     finally:
         release_movement_keys()
+    after = fresh.get("player", {}).get("position", {})
+    if after.get("x") is None or after.get("z") is None:
+        raise RuntimeError("Fresh telemetry has no player position after exploration")
+    end_x = float(after["x"])
+    end_z = float(after["z"])
+    progress = remaining - math.hypot(target_x - end_x, target_z - end_z)
+    EXPLORATION_STALL["last_position"] = (end_x, end_z)
+    if progress < 0.15:
+        EXPLORATION_STALL["count"] += 1
+        print(f"frontier leg made insufficient progress ({progress:.2f} units); "
+              f"consecutive stalls={EXPLORATION_STALL['count']}")
+        current_target = fresh.get("navigation", {}).get("target") or {}
+        current_key = (
+            round(float(current_target.get("x", math.inf)), 2),
+            round(float(current_target.get("z", math.inf)), 2),
+        )
+        if EXPLORATION_STALL["count"] >= 2 and current_key == frontier_key:
+            tap([VK["reject_frontier"]], 0.08)
+            wait_for_state_condition(
+                log_path,
+                fresh_position,
+                lambda updated: (
+                    updated.get("navigation", {}).get("target") is None
+                    or (
+                        round(float(updated["navigation"]["target"]["x"]), 2),
+                        round(float(updated["navigation"]["target"]["z"]), 2),
+                    ) != frontier_key
+                ),
+                timeout=3.0,
+            )
+            print(f"frontier target {frontier_key} rejected after two stalled legs")
+            EXPLORATION_STALL.update(target=None, count=0, last_position=None)
+        return True
+    EXPLORATION_STALL["count"] = 0
     print(
         f"frontier leg completed: target=({target_x:.2f},{target_z:.2f}) "
-        f"planned={leg_distance:.2f} duration={duration:.2f}s"
+        f"planned={leg_distance:.2f} progress={progress:.2f} duration={duration:.2f}s"
     )
+    return True
 
 
 def item_count(state: dict, prefab: str, equipped_only: bool = False) -> int:
@@ -460,7 +518,7 @@ def equip_weapon(log_path: Path) -> None:
 def flee_from_hostile(
     log_path: Path,
     preferred_guid: Optional[int] = None,
-    duration: float = 1.2,
+    duration: float = 1,
     max_bursts: int = 8,
     clear_confirmations: int = 2,
 ) -> None:
@@ -478,7 +536,7 @@ def flee_from_hostile(
                         entity
                         for entity in state.get("nearby", [])
                         if entity.get("guid") == preferred_guid
-                        and entity.get("attackable") is True
+                        and entity.get("activeThreat") is True
                         and float(entity.get("distance", math.inf)) <= 12.0
                     ),
                     None,
@@ -619,6 +677,23 @@ def build_campfire(log_path: Path) -> None:
         timeout=15.0,
     )
     print("build verified: campfire appeared nearby")
+
+
+def build_sciencemachine(log_path: Path) -> None:
+    state, log_position = latest_state(log_path)
+    if not state.get("crafting", {}).get("sciencemachine", False):
+        raise RuntimeError("Science machine is not currently craftable; command not sent")
+    before = nearby_count(state, ("sciencemachine",))
+    hwnd = find_game_window()
+    focus_game(hwnd)
+    tap([VK["build_sciencemachine"]], 0.08)
+    wait_for_state_condition(
+        log_path,
+        log_position,
+        lambda fresh: nearby_count(fresh, ("sciencemachine",)) > before,
+        timeout=15.0,
+    )
+    print("build verified: science machine appeared nearby")
 
 
 SAFE_FOOD_PREFABS = ("berries_cooked", "carrot_cooked", "berries", "carrot", "seeds_cooked", "seeds")
